@@ -1,5 +1,6 @@
 # -*- coding:utf-8 -*-
 import os, sys, time
+import random
 import bpy
 from bpy.props import StringProperty, BoolProperty, EnumProperty, IntProperty
 from bpy.types import Operator
@@ -68,6 +69,95 @@ def _create_pset_for_element(model, element, properties):
 		log.info(f"Created Pset 'Pset_GIS_Attributes' with {len(pset_props)} properties on element {element.id()}")
 	except Exception as e:
 		log.error(f"Failed to create IFC Pset for element {element.id()}: {e}", exc_info=True)
+
+
+def _generate_random_color():
+	"""Generate a random color with good visibility."""
+	# Use golden ratio to generate visually distinct colors
+	hue = random.random()
+	saturation = 0.6 + random.random() * 0.4  # 0.6-1.0 for vibrant colors
+	value = 0.7 + random.random() * 0.3  # 0.7-1.0 for bright colors
+
+	# Convert HSV to RGB
+	import colorsys
+	rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+	return (rgb[0], rgb[1], rgb[2], 1.0)  # RGBA
+
+
+def _get_color_for_field_value(value, color_map):
+	"""Get or generate a color for a specific field value."""
+	if value in color_map:
+		return color_map[value]
+	else:
+		color = _generate_random_color()
+		color_map[value] = color
+		return color
+
+
+def _assign_ifc_surface_style(model, element, color):
+	"""Assign an IfcSurfaceStyle with the given color to an IFC element."""
+	if not IFCOPENSHELL_AVAILABLE:
+		return False
+	try:
+		# Create a material
+		material = ifcopenshell.api.material.add_material(model, name=f"Style_{color[0]:.2f}_{color[1]:.2f}_{color[2]:.2f}")
+
+		# Create a surface style
+		style = ifcopenshell.api.style.add_style(model, name="SurfaceStyle")
+
+		# Set the surface style rendering properties
+		ifcopenshell.api.style.add_surface_style(
+			model,
+			style=style,
+			ifc_class="IfcSurfaceStyleRendering",
+			properties={
+				"SurfaceColour": {
+					"Name": None,
+					"Red": color[0],
+					"Green": color[1],
+					"Blue": color[2]
+				},
+				"ReflectanceMethod": "FLAT",
+				"Transparency": 1.0 - color[3]  # Alpha to transparency
+			}
+		)
+
+		# Assign the style to the material
+		ifcopenshell.api.material.assign_style(model, material=material, style=style)
+
+		# Assign the material to the element
+		ifcopenshell.api.material.assign_material(model, product=element, material=material)
+
+		log.info(f"Assigned IfcSurfaceStyle to element {element.id()} with color RGB({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})")
+		return True
+	except Exception as e:
+		log.error(f"Failed to assign IfcSurfaceStyle to element {element.id()}: {e}", exc_info=True)
+		return False
+
+
+def assign_blender_material(obj, color):
+	"""Assign a Blender material with the given color to an object."""
+	try:
+		# Create or get material
+		mat_name = f"Color_{color[0]:.2f}_{color[1]:.2f}_{color[2]:.2f}"
+		if mat_name in bpy.data.materials:
+			mat = bpy.data.materials[mat_name]
+		else:
+			mat = bpy.data.materials.new(name=mat_name)
+			mat.use_nodes = True
+			bsdf = mat.node_tree.nodes["Principled BSDF"]
+			bsdf.inputs["Base Color"].default_value = color
+			bsdf.inputs["Alpha"].default_value = color[3]
+
+		# Assign material to object
+		if obj.data.materials:
+			obj.data.materials[0] = mat
+		else:
+			obj.data.materials.append(mat)
+
+		log.info(f"Assigned Blender material '{mat_name}' to object '{obj.name}'")
+	except Exception as e:
+		log.error(f"Failed to assign Blender material to object {obj.name}: {e}", exc_info=True)
 
 
 def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_type="", properties=None):
@@ -360,6 +450,17 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			description="IFC user defined type (optional)",
 			default="" )
 
+	# Random coloring
+	useRandomColor: BoolProperty(
+			name="Random color by field",
+			description="Assign random colors (IfcSurfaceStyles) to objects based on unique field values",
+			default=False )
+
+	fieldColorName: EnumProperty(
+		name = "Color field",
+		description = "Choose field to base random coloring on",
+		items = listFields )
+
 
 	def draw(self, context):
 		#Function used by blender to draw the panel.
@@ -394,6 +495,10 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			layout.prop(self, 'ifcClass')
 			layout.prop(self, 'ifcPredefinedType')
 			layout.prop(self, 'ifcUserDefinedType')
+		#
+		layout.prop(self, 'useRandomColor')
+		if self.useRandomColor:
+			layout.prop(self, 'fieldColorName')
 		#
 		geoscn = GeoScene()
 		#geoscnPrefs = context.preferences.addons['geoscene'].preferences
@@ -453,13 +558,18 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 		ifcPredefinedType = self.ifcPredefinedType if self.assignIFC else ""
 		ifcUserDefinedType = self.ifcUserDefinedType if self.assignIFC else ""
 
+		# Prepare coloring parameters
+		colorField = self.fieldColorName if self.useRandomColor else ""
+
 		log.info(f"IFC Assignment: assignIFC={self.assignIFC}, ifcClass={ifcClass}")
+		log.info(f"Random coloring: useRandomColor={self.useRandomColor}, colorField={colorField}")
 
 		try:
 			bpy.ops.importgis.shapefile('INVOKE_DEFAULT', filepath=self.filepath, shpCRS=shpCRS, elevSource=self.vertsElevSource,
 				fieldElevName=elevField, objElevName=objElevName, fieldExtrudeName=extrudField, fieldObjName=nameField,
 				extrusionAxis=self.extrusionAxis, separateObjects=self.separateObjects,
-				ifcClass=ifcClass, ifcPredefinedType=ifcPredefinedType, ifcUserDefinedType=ifcUserDefinedType)
+				ifcClass=ifcClass, ifcPredefinedType=ifcPredefinedType, ifcUserDefinedType=ifcUserDefinedType,
+				useRandomColor=self.useRandomColor, fieldColorName=colorField)
 		except Exception as e:
 			log.error('Shapefile import fails', exc_info=True)
 			self.report({'ERROR'}, 'Shapefile import fails, check logs.')
@@ -492,6 +602,10 @@ class IMPORTGIS_OT_shapefile(Operator):
 	ifcClass: StringProperty(name = "IFC Class", description = "IFC class name for Bonsai/BlenderBIM", default="")
 	ifcPredefinedType: StringProperty(name = "IFC Predefined Type", description = "IFC predefined type", default="")
 	ifcUserDefinedType: StringProperty(name = "IFC User Defined Type", description = "IFC user defined type", default="")
+
+	# Random coloring
+	useRandomColor: BoolProperty(name = "Random color by field", description = "Assign random colors based on field values", default=False)
+	fieldColorName: StringProperty(name = "Color field", description = "Field name for random coloring", default="")
 
 	#Extrusion axis
 	extrusionAxis: EnumProperty(
@@ -594,6 +708,18 @@ class IMPORTGIS_OT_shapefile(Operator):
 
 			if fields[extrudeFieldIdx][1] not in ['N', 'F', 'L'] :
 				self.report({'ERROR'}, "Extrusion field do not contains numeric values")
+				return {'CANCELLED'}
+
+		# Color field lookup
+		colorFieldIdx = None
+		colorMap = {}
+		if self.useRandomColor and self.fieldColorName:
+			try:
+				colorFieldIdx = fieldsNames.index(self.fieldColorName)
+				log.info(f"Color field '{self.fieldColorName}' found at index {colorFieldIdx}")
+			except ValueError:
+				log.error('Unable to find color field', exc_info=True)
+				self.report({'ERROR'}, "Unable to find color field")
 				return {'CANCELLED'}
 
 		#Get shp and scene georef infos
@@ -879,6 +1005,42 @@ class IMPORTGIS_OT_shapefile(Operator):
 				# Assign IFC properties if enabled
 				if self.ifcClass:
 					assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties=shapefile_props)
+
+				# Apply random coloring if enabled
+				if self.useRandomColor and colorFieldIdx is not None:
+					try:
+						# Get the field value for this feature
+						field_value = record[colorFieldIdx]
+						if isinstance(field_value, bytes):
+							field_value = field_value.decode('utf-8', errors='replace').strip()
+						elif field_value is None:
+							field_value = ""
+						else:
+							field_value = str(field_value)
+
+						# Get or generate color for this field value
+						color = _get_color_for_field_value(field_value, colorMap)
+
+						# Apply Blender material (always, for visual feedback)
+						assign_blender_material(obj, color)
+
+						# If Bonsai is available and IFC class was assigned, also assign IfcSurfaceStyle
+						if BONSAI_AVAILABLE and self.ifcClass:
+							try:
+								model = tool.Ifc.get()
+								if model is not None:
+									# Find the IFC element linked to this object
+									for element in model:
+										if element.is_a() == self.ifcClass:
+											linked_obj = tool.Ifc.get_object(element)
+											if linked_obj and linked_obj.name == obj.name:
+												_assign_ifc_surface_style(model, element, color)
+												break
+							except Exception as e:
+								log.warning(f"Could not assign IfcSurfaceStyle for object '{obj.name}': {e}")
+
+					except Exception as e:
+						log.warning(f"Failed to apply coloring for feature {i}: {e}")
 
 			elif self.fieldExtrudeName:
 				#Join to final bmesh (use from_mesh method hack)

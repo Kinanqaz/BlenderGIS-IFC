@@ -1,7 +1,7 @@
 # Shapefile Import with Automatic IFC Assignment
 
 ## Overview
-This feature adds automatic IFC class assignment and Property Set (Pset) mapping to the shapefile import process, streamlining the workflow for converting GIS data to IFC elements using Bonsai (formerly BlenderBIM).
+This feature adds automatic IFC class assignment, Property Set (Pset) mapping, and random coloring to the shapefile import process, streamlining the workflow for converting GIS data to IFC elements using Bonsai (formerly BlenderBIM).
 
 ## How to Use
 
@@ -15,11 +15,18 @@ This feature adds automatic IFC class assignment and Property Set (Pset) mapping
    - **IFC Predefined Type** (optional): Enter the predefined type if applicable
    - **IFC User Defined Type** (optional): Enter a user-defined type if needed
 
-3. **Complete Import**
+3. **Random Coloring by Field (Optional)**
+   - Check the **"Random color by field"** checkbox to enable random coloring
+   - Select a field from the **"Color field"** dropdown to base coloring on
+   - Each unique value in the selected field will receive a distinct random color
+   - Colors are applied as Blender materials for visual feedback
+   - If Bonsai is active with IFC assignment, colors are also applied as IfcSurfaceStyles
+
+4. **Complete Import**
    - Configure other import options as needed (CRS, elevation, extrusion, etc.)
-   - For **Separate Objects** mode, each feature's shapefile attributes will be mapped to an IFC Property Set
+   - Enable **Separate Objects** for individual object coloring (recommended for random coloring)
    - Click OK to import
-   - The imported objects will automatically have IFC classes and geometry representations assigned
+   - The imported objects will automatically have IFC classes, geometry representations, and colors assigned
 
 ## Common IFC Classes for GIS Data
 
@@ -47,6 +54,28 @@ Each imported IFC element will contain a Pset `Pset_GIS_Attributes` with these p
 - `area` = 1250.5 (numeric)
 
 **Note**: Property Sets are only created when using **Separate Objects** mode. Merged/single-object imports do not have individual feature attributes.
+
+## Random Coloring by Field Values
+
+The random coloring feature allows you to visually distinguish objects based on unique values in a selected field.
+
+### How It Works
+- When enabled, each unique value in the selected field receives a distinct random color
+- Colors are generated using HSV color space for good visibility and distinction
+- Blender materials are always applied for immediate visual feedback
+- If Bonsai is active with IFC assignment, IfcSurfaceStyles are also created for proper IFC export
+
+### Example Use Case
+If you have a building shapefile with a `building_type` field containing values like "Residential", "Commercial", "Industrial":
+1. Enable "Random color by field"
+2. Select "building_type" as the color field
+3. All residential buildings will have one color, commercial another, industrial a third
+4. Colors will be consistent across all features with the same field value
+
+### Requirements
+- **Separate Objects mode**: Random coloring requires separate objects to apply individual colors
+- **Field selection**: The chosen field must exist in the shapefile's attribute table
+- **Bonsai/IfcOpenShell**: IfcSurfaceStyles are only applied when Bonsai is active with an open IFC project
 
 ## Integration with Bonsai/BlenderBIM
 
