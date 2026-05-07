@@ -20,7 +20,143 @@ from ..core.utils import perf_clock
 
 from .utils import adjust3Dview, getBBOX, DropToGround
 
+# Try to import Bonsai and ifcopenshell for IFC integration
+IFCOPENSHELL_AVAILABLE = False
+try:
+	import ifcopenshell
+	IFCOPENSHELL_AVAILABLE = True
+	log.info("IfcOpenShell detected - IFC Pset creation available")
+except ImportError:
+	log.info("IfcOpenShell not detected - IFC Pset creation unavailable")
+
+# Try to import Bonsai for IFC integration
+BONSAI_AVAILABLE = False
+try:
+	import bonsai.tool as tool
+	BONSAI_AVAILABLE = True
+	log.info("Bonsai detected - IFC integration available")
+except ImportError:
+	log.info("Bonsai not detected - IFC integration will use custom properties only")
+
+
+def _prepare_pset_properties(properties):
+	"""Convert shapefile field values to IFC-compatible property dict."""
+	pset_props = {}
+	for key, value in properties.items():
+		if isinstance(value, bytes):
+			value = value.decode('utf-8', errors='replace').strip()
+		elif value is None:
+			value = ""
+		elif isinstance(value, (int, float)):
+			value = value
+		else:
+			value = str(value)
+		pset_props[key] = value
+	return pset_props
+
+
+def _create_pset_for_element(model, element, properties):
+	"""Create a Pset_GIS_Attributes on the given IFC element."""
+	if not properties or not IFCOPENSHELL_AVAILABLE:
+		return
+	try:
+		pset_props = _prepare_pset_properties(properties)
+		if not pset_props:
+			return
+		pset = ifcopenshell.api.pset.add_pset(model, product=element, name="Pset_GIS_Attributes")
+		ifcopenshell.api.pset.edit_pset(model, pset=pset, properties=pset_props)
+		log.info(f"Created Pset 'Pset_GIS_Attributes' with {len(pset_props)} properties on element {element.id()}")
+	except Exception as e:
+		log.error(f"Failed to create IFC Pset for element {element.id()}: {e}", exc_info=True)
+
+
+def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_type="", properties=None):
+	"""Assign IFC class to a Blender object using Bonsai API if available, otherwise use custom properties.
+	If properties dict is provided and Bonsai is active, creates an IFC Pset with the shapefile field values."""
+	properties = properties or {}
+	if BONSAI_AVAILABLE:
+		# Save object name before any operations (Bonsai may rename the object)
+		obj_name = obj.name
+		try:
+			# Check if there's an active IFC project
+			model = tool.Ifc.get()
+			if model is None:
+				log.warning("No active IFC project in Bonsai, falling back to custom properties")
+				obj["IfcClass"] = ifc_class
+				if predefined_type:
+					obj["IfcPredefinedType"] = predefined_type
+				if user_defined_type:
+					obj["IfcUserDefinedType"] = user_defined_type
+				for key, value in properties.items():
+					obj[key] = value
+				return
+
+			# Record existing IFC elements before assignment so we can identify
+			# the newly created element afterwards
+			existing_elements = set(model)
+
+			# Use Bonsai's built-in assign_class operator to properly handle
+			# object naming, navigation panel updates, and IFC geometry representation
+			bpy.ops.bim.assign_class(
+				obj=obj_name,
+				ifc_class=ifc_class,
+				predefined_type=predefined_type or "",
+				userdefined_type=user_defined_type or ""
+			)
+
+			# Find the newly created IFC element by looking for elements
+			# that were not in the model before assign_class was called
+			new_element = None
+			for element in model:
+				if element not in existing_elements and element.is_a() == ifc_class:
+					new_element = element
+					break
+
+			if new_element is None:
+				# Fallback: search by linked object name if element identity check failed
+				for element in model:
+					if element.is_a() == ifc_class:
+						linked_obj = tool.Ifc.get_object(element)
+						if linked_obj and linked_obj.name == obj_name:
+							new_element = element
+							break
+
+			if new_element is not None:
+				_create_pset_for_element(model, new_element, properties)
+			else:
+				log.warning(f"Could not identify new IFC element for '{obj_name}' to create Pset")
+
+			log.info(f"Assigned IFC class '{ifc_class}' to object '{obj_name}' using Bonsai API")
+		except Exception as e:
+			log.error(f"Failed to assign IFC class using Bonsai API: {e}", exc_info=True)
+			# Try to find the object by original name in case it was renamed
+			try:
+				if obj_name in bpy.data.objects:
+					obj = bpy.data.objects[obj_name]
+					obj["IfcClass"] = ifc_class
+					if predefined_type:
+						obj["IfcPredefinedType"] = predefined_type
+					if user_defined_type:
+						obj["IfcUserDefinedType"] = user_defined_type
+					for key, value in properties.items():
+						obj[key] = value
+			except Exception as fallback_e:
+				log.error(f"Could not set fallback IFC properties: {fallback_e}")
+	else:
+		# Bonsai not available, use custom properties
+		obj["IfcClass"] = ifc_class
+		if predefined_type:
+			obj["IfcPredefinedType"] = predefined_type
+		if user_defined_type:
+			obj["IfcUserDefinedType"] = user_defined_type
+		for key, value in properties.items():
+			obj[key] = value
+		log.info(f"Assigned IFC class '{ifc_class}' to object '{obj.name}' using custom properties")
+
 PKG, SUBPKG = __package__.split('.', maxsplit=1)
+
+# Temporary storage for batch import file paths
+_batch_files = []
 
 featureType={
 0:'Null',
@@ -203,6 +339,27 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 		description = "Choose field",
 		items = listFields )
 
+	# IFC Assignment
+	assignIFC: BoolProperty(
+			name="Assign IFC Class",
+			description="Assign IFC class to imported objects for Bonsai/BlenderBIM",
+			default=False )
+	
+	ifcClass: StringProperty(
+			name="IFC Class",
+			description="IFC class name (e.g., IfcBuilding, IfcSite, IfcBuildingElementProxy)",
+			default="IfcBuildingElementProxy" )
+	
+	ifcPredefinedType: StringProperty(
+			name="IFC Predefined Type",
+			description="IFC predefined type (optional)",
+			default="" )
+	
+	ifcUserDefinedType: StringProperty(
+			name="IFC User Defined Type",
+			description="IFC user defined type (optional)",
+			default="" )
+
 
 	def draw(self, context):
 		#Function used by blender to draw the panel.
@@ -230,6 +387,13 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			self.useFieldName = False
 		if self.separateObjects and self.useFieldName:
 			layout.prop(self, 'fieldObjName')
+		#
+		layout.separator()
+		layout.prop(self, 'assignIFC')
+		if self.assignIFC:
+			layout.prop(self, 'ifcClass')
+			layout.prop(self, 'ifcPredefinedType')
+			layout.prop(self, 'ifcUserDefinedType')
 		#
 		geoscn = GeoScene()
 		#geoscnPrefs = context.preferences.addons['geoscene'].preferences
@@ -284,10 +448,18 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 		else:
 			shpCRS = self.shpCRS
 
+		# Prepare IFC parameters
+		ifcClass = self.ifcClass if self.assignIFC else ""
+		ifcPredefinedType = self.ifcPredefinedType if self.assignIFC else ""
+		ifcUserDefinedType = self.ifcUserDefinedType if self.assignIFC else ""
+
+		log.info(f"IFC Assignment: assignIFC={self.assignIFC}, ifcClass={ifcClass}")
+
 		try:
 			bpy.ops.importgis.shapefile('INVOKE_DEFAULT', filepath=self.filepath, shpCRS=shpCRS, elevSource=self.vertsElevSource,
 				fieldElevName=elevField, objElevName=objElevName, fieldExtrudeName=extrudField, fieldObjName=nameField,
-				extrusionAxis=self.extrusionAxis, separateObjects=self.separateObjects)
+				extrusionAxis=self.extrusionAxis, separateObjects=self.separateObjects,
+				ifcClass=ifcClass, ifcPredefinedType=ifcPredefinedType, ifcUserDefinedType=ifcUserDefinedType)
 		except Exception as e:
 			log.error('Shapefile import fails', exc_info=True)
 			self.report({'ERROR'}, 'Shapefile import fails, check logs.')
@@ -316,6 +488,11 @@ class IMPORTGIS_OT_shapefile(Operator):
 	fieldExtrudeName: StringProperty(name = "Extrusion field", description = "Field name")
 	fieldObjName: StringProperty(name = "Objects names field", description = "Field name")
 
+	# IFC Assignment
+	ifcClass: StringProperty(name = "IFC Class", description = "IFC class name for Bonsai/BlenderBIM", default="")
+	ifcPredefinedType: StringProperty(name = "IFC Predefined Type", description = "IFC predefined type", default="")
+	ifcUserDefinedType: StringProperty(name = "IFC User Defined Type", description = "IFC user defined type", default="")
+
 	#Extrusion axis
 	extrusionAxis: EnumProperty(
 			name="Extrude along",
@@ -340,6 +517,8 @@ class IMPORTGIS_OT_shapefile(Operator):
 	def execute(self, context):
 
 		prefs = bpy.context.preferences.addons[PKG].preferences
+
+		log.info(f"IFC parameters received: ifcClass={self.ifcClass}, ifcPredefinedType={self.ifcPredefinedType}, ifcUserDefinedType={self.ifcUserDefinedType}")
 
 		#Set cursor representation to 'loading' icon
 		w = context.window
@@ -682,7 +861,8 @@ class IMPORTGIS_OT_shapefile(Operator):
 				# so we must avoid using operators when created many objects with the 'separate objects' option)
 				##bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY')
 
-				#write attributes data
+				#write attributes data and build properties dict for IFC Psets
+				shapefile_props = {}
 				for i, field in enumerate(shp.fields):
 					fieldName, fieldType, fieldLength, fieldDecLength = field
 					if fieldName != 'DeletionFlag':
@@ -691,8 +871,14 @@ class IMPORTGIS_OT_shapefile(Operator):
 							if v is not None:
 								#cast to float to avoid overflow error when affecting custom property
 								obj[fieldName] = float(record[i-1])
+								shapefile_props[fieldName] = float(record[i-1])
 						else:
 							obj[fieldName] = record[i-1]
+							shapefile_props[fieldName] = record[i-1]
+
+				# Assign IFC properties if enabled
+				if self.ifcClass:
+					assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties=shapefile_props)
 
 			elif self.fieldExtrudeName:
 				#Join to final bmesh (use from_mesh method hack)
@@ -724,6 +910,10 @@ class IMPORTGIS_OT_shapefile(Operator):
 			obj.select_set(True)
 			bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY')
 
+			# Assign IFC properties if enabled (no individual shapefile record for merged object)
+			if self.ifcClass:
+				assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties={})
+
 		#free the bmesh
 		bm.free()
 
@@ -738,10 +928,225 @@ class IMPORTGIS_OT_shapefile(Operator):
 
 		return {'FINISHED'}
 
+class IMPORTGIS_OT_shapefile_batch_file_dialog(Operator):
+	"""Select multiple shp files and start batch import"""
+
+	bl_idname = "importgis.shapefile_batch_file_dialog"
+	bl_description = 'Batch import ESRI shapefiles (.shp)'
+	bl_label = "Batch Import SHP"
+	bl_options = {'INTERNAL'}
+
+	directory: StringProperty(
+		name="Directory",
+		description="Directory of selected files",
+		subtype='DIR_PATH')
+
+	files: bpy.props.CollectionProperty(
+		type=bpy.types.OperatorFileListElement,
+		options={'HIDDEN'})
+
+	filter_glob: StringProperty(
+			default = "*.shp",
+			options = {'HIDDEN'} )
+
+	def invoke(self, context, event):
+		context.window_manager.fileselect_add(self)
+		return {'RUNNING_MODAL'}
+
+	def draw(self, context):
+		layout = self.layout
+		layout.label(text="Select multiple .shp files")
+		layout.label(text="Options will be available after selection")
+
+	def execute(self, context):
+		global _batch_files
+		_batch_files = []
+		for file_entry in self.files:
+			if file_entry.name.lower().endswith('.shp'):
+				_batch_files.append(os.path.join(self.directory, file_entry.name))
+		if not _batch_files:
+			self.report({'ERROR'}, "No .shp files selected")
+			return {'CANCELLED'}
+		bpy.ops.importgis.shapefile_batch_props_dialog('INVOKE_DEFAULT')
+		return{'FINISHED'}
+
+
+class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
+	"""Batch shapefile importer properties dialog"""
+
+	bl_idname = "importgis.shapefile_batch_props_dialog"
+	bl_description = 'Batch import ESRI shapefiles (.shp)'
+	bl_label = "Batch Import SHP"
+	bl_options = {"INTERNAL"}
+
+	#special function to auto redraw an operator popup called through invoke_props_dialog
+	def check(self, context):
+		return True
+
+	def listPredefCRS(self, context):
+		return PredefCRS.getEnumItems()
+
+	def listObjects(self, context):
+		objs = []
+		for index, object in enumerate(bpy.context.scene.objects):
+			if object.type == 'MESH':
+				objs.append((object.name, object.name, "Object named " + object.name))
+		return objs
+
+	reprojection: BoolProperty(
+			name="Specifiy shapefile CRS",
+			description="Specifiy shapefile CRS if it's different from scene CRS",
+			default=False )
+
+	shpCRS: EnumProperty(
+		name = "Shapefile CRS",
+		description = "Choose a Coordinate Reference System",
+		items = listPredefCRS)
+
+	vertsElevSource: EnumProperty(
+			name="Elevation source",
+			description="Select the source of vertices z value",
+			items=[
+			('NONE', 'None', "Flat geometry"),
+			('GEOM', 'Geometry', "Use z value from shape geometry if exists"),
+			('OBJ', 'Object', "Get z elevation value from an existing ground mesh")
+			],
+			default='GEOM')
+
+	objElevLst: EnumProperty(
+		name="Elev. object",
+		description="Choose the mesh from which extract z elevation",
+		items=listObjects )
+
+	separateObjects: BoolProperty(
+			name="Separate objects",
+			description="Warning : can be very slow with lot of features",
+			default=False )
+
+	assignIFC: BoolProperty(
+			name="Assign IFC Class",
+			description="Assign IFC class to imported objects for Bonsai/BlenderBIM",
+			default=False )
+
+	ifcClass: StringProperty(
+			name="IFC Class",
+			description="IFC class name (e.g., IfcBuilding, IfcSite, IfcBuildingElementProxy)",
+			default="IfcBuildingElementProxy" )
+
+	ifcPredefinedType: StringProperty(
+			name="IFC Predefined Type",
+			description="IFC predefined type (optional)",
+			default="" )
+
+	ifcUserDefinedType: StringProperty(
+			name="IFC User Defined Type",
+			description="IFC user defined type (optional)",
+			default="" )
+
+	def draw(self, context):
+		scn = context.scene
+		layout = self.layout
+
+		layout.prop(self, 'vertsElevSource')
+		if self.vertsElevSource == 'OBJ':
+			layout.prop(self, 'objElevLst')
+
+		layout.prop(self, 'separateObjects')
+
+		layout.separator()
+		layout.prop(self, 'assignIFC')
+		if self.assignIFC:
+			layout.prop(self, 'ifcClass')
+			layout.prop(self, 'ifcPredefinedType')
+			layout.prop(self, 'ifcUserDefinedType')
+
+		geoscn = GeoScene()
+		if geoscn.isPartiallyGeoref:
+			layout.prop(self, 'reprojection')
+			if self.reprojection:
+				self.shpCRSInputLayout(context)
+			georefManagerLayout(self, context)
+		else:
+			self.shpCRSInputLayout(context)
+
+	def shpCRSInputLayout(self, context):
+		layout = self.layout
+		row = layout.row(align=True)
+		split = row.split(factor=0.35, align=True)
+		split.label(text='CRS:')
+		split.prop(self, "shpCRS", text='')
+		row.operator("bgis.add_predef_crs", text='', icon='ADD')
+
+	def invoke(self, context, event):
+		return context.window_manager.invoke_props_dialog(self)
+
+	def execute(self, context):
+		global _batch_files
+
+		if self.vertsElevSource == 'OBJ':
+			if not self.objElevLst:
+				self.report({'ERROR'}, "No elevation object")
+				return {'CANCELLED'}
+			else:
+				objElevName = self.objElevLst
+		else:
+			objElevName = ''
+
+		geoscn = GeoScene()
+		if geoscn.isBroken:
+			self.report({'ERROR'}, "Scene georef is broken, please fix it beforehand")
+			return {'CANCELLED'}
+
+		if geoscn.isGeoref:
+			if self.reprojection:
+				shpCRS = self.shpCRS
+			else:
+				shpCRS = geoscn.crs
+		else:
+			shpCRS = self.shpCRS
+
+		ifcClass = self.ifcClass if self.assignIFC else ""
+		ifcPredefinedType = self.ifcPredefinedType if self.assignIFC else ""
+		ifcUserDefinedType = self.ifcUserDefinedType if self.assignIFC else ""
+
+		errors = []
+		imported = 0
+		for filepath in _batch_files:
+			try:
+				bpy.ops.importgis.shapefile(
+					filepath=filepath,
+					shpCRS=shpCRS,
+					elevSource=self.vertsElevSource,
+					fieldElevName='',
+					objElevName=objElevName,
+					fieldExtrudeName='',
+					fieldObjName='',
+					extrusionAxis='Z',
+					separateObjects=self.separateObjects,
+					ifcClass=ifcClass,
+					ifcPredefinedType=ifcPredefinedType,
+					ifcUserDefinedType=ifcUserDefinedType)
+				imported += 1
+			except Exception as e:
+				log.error('Batch shapefile import fails for %s', filepath, exc_info=True)
+				errors.append(os.path.basename(filepath))
+
+		_batch_files = []
+
+		if errors:
+			self.report({'WARNING'}, "Imported %i file(s), %i failed: %s" % (imported, len(errors), ', '.join(errors)))
+		else:
+			self.report({'INFO'}, "Successfully imported %i shapefile(s)" % imported)
+
+		return{'FINISHED'}
+
+
 classes = [
 	IMPORTGIS_OT_shapefile_file_dialog,
 	IMPORTGIS_OT_shapefile_props_dialog,
-	IMPORTGIS_OT_shapefile
+	IMPORTGIS_OT_shapefile,
+	IMPORTGIS_OT_shapefile_batch_file_dialog,
+	IMPORTGIS_OT_shapefile_batch_props_dialog
 ]
 
 def register():

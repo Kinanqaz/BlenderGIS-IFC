@@ -20,7 +20,7 @@
 import bpy
 
 bl_info = {
-	'name': 'BlenderGIS',
+	'name': 'BlenderGIS-IFC',
 	'description': 'Various tools for handle geodata',
 	'author': 'domlysz',
 	'license': 'GPL',
@@ -197,6 +197,7 @@ class VIEW3D_MT_menu_gis_import(bpy.types.Menu):
 	def draw(self, context):
 		if IMPORT_SHP:
 			self.layout.operator("importgis.shapefile_file_dialog", icon_value=icons_dict["shp"].icon_id, text='Shapefile (.shp)')
+			self.layout.operator("importgis.shapefile_batch_file_dialog", icon_value=icons_dict["shp"].icon_id, text='Shapefile Batch (.shp)')
 		if IMPORT_GEORASTER:
 			self.layout.operator("importgis.georaster", icon_value=icons_dict["raster"].icon_id, text="Georeferenced raster (.tif .jpg .jp2 .png)")
 		if IMPORT_OSM:
@@ -253,7 +254,7 @@ class VIEW3D_MT_menu_gis_nodes(bpy.types.Menu):
 			self.layout.operator("analysis.nodes", icon_value=icons_dict["terrain"].icon_id, text='Terrain analysis')
 
 class VIEW3D_MT_menu_gis(bpy.types.Menu):
-	bl_label = "GIS"
+	bl_label = "GIS-IFC"
 	# Set the menu operators and draw functions
 	def draw(self, context):
 		layout = self.layout

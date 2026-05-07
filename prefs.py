@@ -69,7 +69,7 @@ DEFAULT_OSM_TAGS = [
 class BGIS_OT_pref_show(Operator):
 
 	bl_idname = "bgis.pref_show"
-	bl_description = 'Display BlenderGIS addons preferences'
+	bl_description = 'Display BlenderGIS-IFC addons preferences'
 	bl_label = "Preferences"
 	bl_options = {'INTERNAL'}
 
